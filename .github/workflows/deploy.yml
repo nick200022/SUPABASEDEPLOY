@@ -1,0 +1,112 @@
+name: Supabase Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Deploy to Supabase
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_DIR: supabase            # ruta relativa al directorio supabase
+      EXPORT_SCRIPT: scripts/export-data.sh
+      SEED_FILE: supabase/seed.sql
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install supabase CLI
+        run: |
+          curl -sL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+          npm install -g supabase
+      - name: Authenticate Supabase CLI
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          # El CLI usará SUPABASE_ACCESS_TOKEN para autenticar. Ajusta si usas otro método.
+          supabase login --service-role $SUPABASE_ACCESS_TOKEN || true
+
+      - name: Deploy Supabase project
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        working-directory: ${{ env.SUPABASE_DIR }}
+        run: |
+          # Ajusta el comando si usas un flujo diferente (por ejemplo supabase deploy --project-ref ...)
+          supabase deploy --project-ref ${{ secrets.SUPABASE_PROJECT_REF }}
+
+      - name: Run DB seeds (run-seeds)
+        if: success()
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        working-directory: ${{ env.SUPABASE_DIR }}
+        run: |
+          if [ -f "${{ env.SEED_FILE }}" ]; then
+            echo "Applying SQL seed file: $SEED_FILE"
+            # Ejecuta con psql usando SUPABASE_DB_URL
+            psql "${SUPABASE_DB_URL}" -f "${SEED_FILE}"
+          else
+            echo "No seed file found at $SEED_FILE, skipping."
+          fi
+
+      - name: Run tests (run-tests)
+        if: success()
+        run: |
+          echo "Installing dependencies"
+          npm ci
+          echo "Running tests"
+          npm run test
+
+      - name: Export data (export-data)
+        if: success()
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          if [ -x "${{ env.EXPORT_SCRIPT }}" ]; then
+            echo "Running export script: $EXPORT_SCRIPT"
+            "${{ env.EXPORT_SCRIPT }}"
+          else
+            echo "Export script not found or not executable at $EXPORT_SCRIPT"
+            exit 0
+          fi
+
+      - name: Notify Slack (notify-slack)
+        if: success()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "No SLACK_WEBHOOK_URL set, skipping Slack notification."
+            exit 0
+          fi
+          payload=$(jq -n --arg repo "$REPO" --arg ref "$REF" --arg run "$RUN_URL" \
+            '{text: ("Supabase deploy successful for " + $repo + " on " + $ref + ". Run: " + $run)}')
+          curl -sS -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
+
+      - name: Notify Slack on failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "No SLACK_WEBHOOK_URL set, skipping Slack failure notification."
+            exit 0
+          fi
+          payload=$(jq -n --arg repo "$REPO" --arg ref "$REF" --arg run "$RUN_URL" \
+            '{text: ("Supabase deploy failed for " + $repo + " on " + $ref + ". Run: " + $run)}')
+          curl -sS -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
